@@ -1,0 +1,17 @@
+[Unit]
+Description=AgriCloud DLinear and N-BEATS Forecast Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/agricloud/model-service
+EnvironmentFile=/opt/agricloud/model-service/.env
+ExecStart=/opt/agricloud/model-service/.venv/bin/uvicorn agricloud_forecast.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
