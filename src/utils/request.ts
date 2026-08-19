@@ -225,7 +225,11 @@ const request = <T = unknown, TData = Record<string, unknown>>(options: HttpRequ
         resolve(resolveBusinessData<T>(data))
       },
       fail: (error) => {
-        const message = import.meta.env.DEV
+        // Native request failures happen below the WebView layer (DNS, TLS,
+        // socket, system policy, etc.). Keep the original App error visible so
+        // a release build does not collapse every cause into the same message.
+        // H5 keeps the concise production message used by browsers.
+        const message = import.meta.env.DEV || isAppRuntime()
           ? (error?.errMsg ? `${error.errMsg}（${requestUrl}）` : `网络异常（${requestUrl}）`)
           : '网络连接失败，请检查网络后重试'
         reject(createHttpError(-1, message, undefined, error))

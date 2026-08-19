@@ -114,7 +114,19 @@ const handleLogin = async () => {
       uni.reLaunch({ url: getPostLoginRedirect() })
     }, 500)
   } catch (error: any) {
-    uni.showToast({ title: error.message || '登录失败', icon: 'error' })
+    const errorMessage = error?.message || '登录失败'
+    // #ifdef APP-PLUS
+    if (error?.code === -1) {
+      uni.showModal({
+        title: '连接失败',
+        content: errorMessage,
+        showCancel: false,
+        confirmText: '知道了',
+      })
+      return
+    }
+    // #endif
+    uni.showToast({ title: errorMessage, icon: 'error' })
   } finally {
     isSubmitting.value = false
   }

@@ -2,8 +2,8 @@
     "name" : "AgriCloudManager",
     "appid" : "__UNI__A0763C1",
     "description" : "面向种植户的农事管理、行情预测、销路匹配与智能营销工具",
-    "versionName" : "1.6.10",
-    "versionCode" : 1610,
+    "versionName" : "1.6.11",
+    "versionCode" : 1611,
     "transformPx" : false,
     /* 5+App特有相关 */
     "app-plus" : {
