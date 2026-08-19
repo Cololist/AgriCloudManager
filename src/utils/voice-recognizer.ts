@@ -1,9 +1,8 @@
 import { recognizeSpeech } from '../api/speech'
 
-type SpeechRecognitionCtor = new () => any
+type AudioContextCtor = new (options?: AudioContextOptions) => AudioContext
 type SpeechErrorMap = Record<string, string>
 
-const RECOGNIZE_TIMEOUT = 12000
 const APP_RECORD_DURATION = 8000
 
 const speechErrorMessages: SpeechErrorMap = {
@@ -17,83 +16,184 @@ const speechErrorMessages: SpeechErrorMap = {
 }
 
 const getSpeechErrorMessage = (error?: string, fallback?: string) => {
-  if (error && speechErrorMessages[error]) return speechErrorMessages[error]
+  const normalizedError = String(error || '')
+    .replace(/Error$/i, '')
+    .replace(/([a-z])([A-Z])/g, '$1-$2')
+    .toLowerCase()
+  const mappedError = normalizedError === 'not-readable' || normalizedError === 'not-found'
+    ? 'audio-capture'
+    : normalizedError === 'security'
+      ? 'not-allowed'
+      : normalizedError
+  if (mappedError && speechErrorMessages[mappedError]) return speechErrorMessages[mappedError]
   return fallback || `语音识别失败${error ? `：${error}` : ''}，请使用文字输入`
 }
 
-const getSpeechRecognition = (): SpeechRecognitionCtor | null => {
+const getAudioContext = (): AudioContextCtor | null => {
   if (typeof window === 'undefined') return null
-  return (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition || null
+  return (window.AudioContext || (window as any).webkitAudioContext || null) as AudioContextCtor | null
 }
 
-const startWebSpeechRecognize = (): Promise<string> => {
-  return new Promise<string>((resolve, reject) => {
-    const Recognition = getSpeechRecognition()
-    if (!Recognition) {
-      reject(new Error('当前浏览器不支持语音识别，请使用文字输入'))
+const float32ToPcm16 = (samples: Float32Array) => {
+  const pcm = new Uint8Array(samples.length * 2)
+  const view = new DataView(pcm.buffer)
+  samples.forEach((sample, index) => {
+    const clamped = Math.max(-1, Math.min(1, sample))
+    const value = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff
+    view.setInt16(index * 2, Math.round(value), true)
+  })
+  return pcm
+}
+
+const resampleTo16Khz = (samples: Float32Array, inputSampleRate: number) => {
+  const outputSampleRate = 16000
+  if (inputSampleRate === outputSampleRate) return samples
+  if (inputSampleRate < outputSampleRate) {
+    throw new Error(`当前设备录音采样率${inputSampleRate}Hz不受支持`)
+  }
+
+  const ratio = inputSampleRate / outputSampleRate
+  const outputLength = Math.max(1, Math.round(samples.length / ratio))
+  const output = new Float32Array(outputLength)
+  let inputOffset = 0
+
+  for (let outputOffset = 0; outputOffset < outputLength; outputOffset += 1) {
+    const nextInputOffset = Math.min(samples.length, Math.round((outputOffset + 1) * ratio))
+    let sum = 0
+    let count = 0
+    for (; inputOffset < nextInputOffset; inputOffset += 1) {
+      sum += samples[inputOffset]
+      count += 1
+    }
+    output[outputOffset] = count ? sum / count : 0
+  }
+
+  return output
+}
+
+const bytesToBase64 = (bytes: Uint8Array) => {
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)))
+  }
+  return window.btoa(binary)
+}
+
+const mergeAudioChunks = (chunks: Float32Array[], totalLength: number) => {
+  const merged = new Float32Array(totalLength)
+  let offset = 0
+  chunks.forEach((chunk) => {
+    merged.set(chunk, offset)
+    offset += chunk.length
+  })
+  return merged
+}
+
+const recordWebVoice = (): Promise<{ audioBase64: string; format: string }> => {
+  return new Promise(async (resolve, reject) => {
+    const AudioContextClass = getAudioContext()
+    if (!navigator.mediaDevices?.getUserMedia || !AudioContextClass) {
+      reject(new Error('当前浏览器不支持麦克风录音，请使用文字输入'))
       return
     }
 
-    const recognition = new Recognition()
+    let stream: MediaStream | null = null
+    let audioContext: AudioContext | null = null
+    let source: MediaStreamAudioSourceNode | null = null
+    let processor: ScriptProcessorNode | null = null
+    let silentGain: GainNode | null = null
+    let timer: ReturnType<typeof setTimeout> | null = null
     let settled = false
+    const chunks: Float32Array[] = []
+    let totalLength = 0
 
-    const finish = (callback: () => void) => {
+    const cleanup = async () => {
+      if (timer) clearTimeout(timer)
+      try { processor?.disconnect() } catch (_error) { /* Already disconnected. */ }
+      try { source?.disconnect() } catch (_error) { /* Already disconnected. */ }
+      try { silentGain?.disconnect() } catch (_error) { /* Already disconnected. */ }
+      stream?.getTracks().forEach((track) => {
+        try { track.stop() } catch (_error) { /* Already stopped. */ }
+      })
+      if (audioContext && audioContext.state !== 'closed') {
+        await audioContext.close().catch(() => undefined)
+      }
+    }
+
+    const finish = async (callback: () => void) => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
+      await cleanup()
       callback()
     }
 
-    const timer = setTimeout(() => {
-      finish(() => {
-        try {
-          recognition.stop()
-        } catch (error) {
-          console.warn('[voice] H5 stop error:', error)
-        }
-        reject(new Error('长时间没有检测到语音，请重新尝试或使用文字输入'))
-      })
-    }, RECOGNIZE_TIMEOUT)
-
-    recognition.lang = 'zh-CN'
-    recognition.continuous = false
-    recognition.interimResults = false
-    recognition.maxAlternatives = 1
-
-    recognition.onresult = (event: any) => {
-      const text = String(event?.results?.[0]?.[0]?.transcript || '').trim()
-      console.log('[voice] H5 result:', text)
-      finish(() => {
-        if (text) {
-          resolve(text)
-          return
-        }
-        reject(new Error('没有识别到有效语音，请重新尝试或使用文字输入'))
-      })
-    }
-
-    recognition.onerror = (event: any) => {
-      console.warn('[voice] H5 error:', event)
-      finish(() => {
-        reject(new Error(getSpeechErrorMessage(event?.error)))
-      })
-    }
-
-    recognition.onnomatch = () => {
-      finish(() => {
-        reject(new Error('没有识别到有效语音，请重新尝试或使用文字输入'))
-      })
-    }
-
     try {
-      recognition.start()
+      // iOS WebKit only permits AudioContext activation during a direct user gesture.
+      audioContext = new AudioContextClass({ latencyHint: 'interactive' })
+      if (audioContext.state === 'suspended') await audioContext.resume()
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      })
+      if (settled) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
+
+      source = audioContext.createMediaStreamSource(stream)
+      processor = audioContext.createScriptProcessor(4096, 1, 1)
+      silentGain = audioContext.createGain()
+      silentGain.gain.value = 0
+
+      processor.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0)
+        const copy = new Float32Array(input.length)
+        copy.set(input)
+        chunks.push(copy)
+        totalLength += copy.length
+      }
+
+      source.connect(processor)
+      processor.connect(silentGain)
+      silentGain.connect(audioContext.destination)
+      uni.showToast({ title: '请说话，8 秒内自动识别', icon: 'none' })
+
+      timer = setTimeout(() => {
+        const sampleRate = audioContext?.sampleRate || 0
+        void finish(() => {
+          try {
+            if (!totalLength || !sampleRate) {
+              reject(new Error('没有录制到有效语音，请检查麦克风权限后重试'))
+              return
+            }
+            const merged = mergeAudioChunks(chunks, totalLength)
+            const pcm = float32ToPcm16(resampleTo16Khz(merged, sampleRate))
+            resolve({ audioBase64: bytesToBase64(pcm), format: 'pcm' })
+          } catch (error: any) {
+            reject(error)
+          }
+        })
+      }, APP_RECORD_DURATION)
     } catch (error: any) {
-      console.warn('[voice] H5 error:', error)
-      finish(() => {
-        reject(new Error(getSpeechErrorMessage(error?.name || error?.message, '语音识别启动失败，请使用文字输入')))
+      console.warn('[voice] H5 recorder error:', error)
+      void finish(() => {
+        reject(new Error(getSpeechErrorMessage(error?.name || error?.message, '录音启动失败，请允许使用麦克风')))
       })
     }
   })
+}
+
+const startWebSpeechRecognize = async (): Promise<string> => {
+  const recording = await recordWebVoice()
+  const result = await recognizeSpeech(recording)
+  const text = String(result?.text || '').trim()
+  if (text) return text
+  throw new Error('没有识别到有效语音，请重新尝试或使用文字输入')
 }
 
 const waitForPlusReady = () => {
@@ -217,8 +317,6 @@ const recordAppVoice = (): Promise<{ audioBase64: string; format: string }> => {
       recorder.start({
         duration: APP_RECORD_DURATION,
         sampleRate: 16000,
-        numberOfChannels: 1,
-        encodeBitRate: 256000,
         format: 'PCM' as any,
       })
       uni.showToast({ title: '请说话，8 秒内自动识别', icon: 'none' })
@@ -266,7 +364,7 @@ const startPlusSpeechRecognize = async (): Promise<string> => {
 
 export const isVoiceRecognizeSupported = () => {
   // #ifdef H5
-  return Boolean(getSpeechRecognition())
+  return Boolean(typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia && getAudioContext())
   // #endif
 
   // #ifdef APP-PLUS
